@@ -48,10 +48,13 @@ Complete guide for integrating Shelfex OAuth 2.0 authentication into your applic
 3. User logs in → SSO validates credentials → generates auth code directly in login response → SSO frontend redirects user to your callback URL with code
 4. Your frontend sends code + PKCE verifier to your backend
 5. Your backend exchanges code + verifier + client_secret for tokens via SSO `/oauth/token`
-6. Tokens stored in httpOnly cookies on your domain
-7. Middleware validates JWT on subsequent requests
+6. Tokens stored in httpOnly cookies on your backend's domain (for API requests)
+7. Backend returns access_token in response body → **callback page sets `session_token` cookie on the Next.js domain** (so middleware can detect auth)
+8. Middleware validates JWT on subsequent requests
 
 > **Cross-Domain Note:** The login-initiated flow (step 3) generates the auth code directly after password verification, avoiding the need for an `accounts_session` cookie. This ensures SSO works across any domains — not just subdomains of the same site.
+
+> **Cookie Architecture Note:** When the Next.js frontend (e.g. port 3001) and Express backend (e.g. port 4000) run on different ports, they are different origins. httpOnly cookies set by the backend are only sent to the backend — the Next.js middleware cannot read them. To solve this, the backend returns the `access_token` in the callback response body, and the callback page sets a `session_token` cookie on the Next.js domain for middleware to check.
 
 ---
 
@@ -186,15 +189,17 @@ export async function middleware(request: NextRequest) {
     return response;
   }
 
-  // Check for valid access token
-  const accessToken = request.cookies.get('access_token')?.value;
+  // Check session_token (set by callback page on this domain) or access_token (if same-origin)
+  // When frontend and backend are on different ports, the backend's httpOnly cookies
+  // are NOT visible here — session_token bridges that gap.
+  const sessionToken = request.cookies.get('session_token')?.value || request.cookies.get('access_token')?.value;
 
-  if (!accessToken) {
+  if (!sessionToken) {
     return await redirectToSSO(request);
   }
 
   // Decode without verification — just check expiry (verification is server-side)
-  const decoded = decodeJwtPayload(accessToken);
+  const decoded = decodeJwtPayload(sessionToken);
   if (!decoded || typeof decoded.exp !== 'number' || decoded.exp * 1000 < Date.now()) {
     return await redirectToSSO(request);
   }
@@ -249,10 +254,13 @@ async function redirectToSSO(request: NextRequest) {
 
   const response = NextResponse.redirect(`${ssoUrl}/oauth/authorize?${params.toString()}`);
 
+  // SameSite=None is required because the OAuth redirect chain goes cross-site
+  // (your app → SSO → your app), and browsers won't send SameSite=Lax cookies
+  // on the final redirect back. Secure=true works on localhost (secure context).
   const cookieOptions = {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax' as const,
+    secure: true,
+    sameSite: 'none' as const,
     maxAge: 60 * 10, // 10 minutes
     path: '/',
   };
@@ -306,8 +314,8 @@ function CallbackContent() {
           .find((c) => c.startsWith('pkce_verifier='))
           ?.split('=')[1];
 
-        // Clear the one-time PKCE verifier cookie
-        document.cookie = 'pkce_verifier=; path=/; max-age=0';
+        // Clear the one-time PKCE verifier cookie (must match Secure + SameSite=None)
+        document.cookie = 'pkce_verifier=; path=/; max-age=0; SameSite=None; Secure';
 
         // Send code + verifier to your backend for token exchange
         const response = await fetch(
@@ -329,7 +337,17 @@ function CallbackContent() {
           throw new Error(data.message || 'Authentication failed');
         }
 
-        router.replace('/dashboard');
+        const result = await response.json();
+
+        // Set session cookie on the Next.js domain so middleware can detect auth.
+        // The httpOnly cookies from the backend (different port) aren't visible to middleware.
+        const token = result?.data?.access_token;
+        if (token) {
+          document.cookie = `session_token=${token}; path=/; max-age=3600; SameSite=Lax`;
+        }
+
+        // Full reload so auth context re-fetches with the new cookies
+        window.location.href = '/dashboard';
       } catch (err: any) {
         setError(err.message || 'Authentication failed');
       }
@@ -416,7 +434,9 @@ export const callback = async (req: Request, res: Response, next: NextFunction):
       path: '/',
     });
 
-    res.status(200).json({ success: true, message: 'Authentication successful' });
+    // Return access_token in body so the Next.js callback page can set a
+    // session cookie on its own domain (needed when frontend/backend are different origins)
+    res.status(200).json({ success: true, message: 'Authentication successful', data: { access_token } });
   } catch (error: any) {
     const status = error.response?.status || 500;
     const message = error.response?.data?.message || 'Token exchange failed';
@@ -528,12 +548,15 @@ Clearing cookies on your domain is not enough — the `accounts_session` cookie 
 
 ```typescript
 const handleLogout = async () => {
-  // 1. Clear your app's cookies
+  // 1. Clear your app's cookies (API domain)
   await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/logout`, {
     method: 'POST', credentials: 'include',
   });
 
-  // 2. Redirect to SSO logout to clear accounts_session
+  // 2. Clear the session_token cookie on the Next.js domain
+  document.cookie = 'session_token=; path=/; max-age=0';
+
+  // 3. Redirect to SSO logout to clear accounts_session
   const ssoUrl = process.env.NEXT_PUBLIC_SSO_URL;
   window.location.href = `${ssoUrl}/auth/logout?redirect_uri=${encodeURIComponent(window.location.origin)}`;
 };
@@ -626,8 +649,8 @@ These are handled automatically by the SSO and your integration:
 | **Refresh Token Rotation** | Each refresh invalidates the old token and issues a new one. Reuse of a revoked token revokes ALL sessions for that user. |
 | **Hashed Secrets** | Auth codes, OTPs, and refresh tokens are SHA-256 hashed before DB storage. |
 | **Rate Limiting** | Login: 5/15min per account + 20/15min per IP. Registration: 5/hour per IP. |
-| **httpOnly Cookies** | All auth tokens in httpOnly cookies — no JS access. |
-| **sameSite: lax** | Cookies are not sent on cross-site POST requests, preventing CSRF. |
+| **httpOnly Cookies** | Auth tokens (`access_token`, `refresh_token`) in httpOnly cookies — no JS access. `session_token` on the Next.js domain is non-httpOnly (JWT only, used for middleware routing). |
+| **sameSite: none + secure** | OAuth flow cookies (`oauth_state`, `pkce_verifier`, `oauth_nonce`) use `SameSite=None; Secure` to survive cross-site redirect chains. API cookies use `SameSite=Lax`. |
 
 ### What you must do
 
@@ -702,8 +725,9 @@ cd your-app/client && npm run dev
 | "Invalid client credentials" | Wrong `client_secret` | Verify plaintext secret matches what was bcrypt-hashed in DB |
 | "PKCE code_verifier required" | Missing verifier in token exchange | Ensure `pkce_verifier` cookie is set and forwarded to backend |
 | "Invalid code_verifier" | PKCE verification failed | Verify `code_challenge = BASE64URL(SHA256(code_verifier))` |
-| "Invalid state parameter" | State cookie expired or mismatch | Complete OAuth flow within 10 minutes |
-| Cookies not set | `secure: true` without HTTPS | Use `NODE_ENV=development` locally |
+| "Invalid state parameter" | State cookie expired or mismatch | Complete OAuth flow within 10 minutes. Ensure OAuth cookies use `SameSite=None; Secure` (required for cross-site redirect chains). |
+| Cookies not set | `secure: true` without HTTPS | `localhost` is a secure context so `Secure` cookies work. For non-localhost dev, use `NODE_ENV=development`. |
+| Middleware always redirects to SSO | `access_token` cookie is on the API domain (different port), invisible to Next.js middleware | Use `session_token` cookie set by callback page on the Next.js domain (see Step 2). |
 | Infinite redirect loop | Callback route is protected | Ensure middleware excludes `/auth/error` only (NOT all `/auth/*` — `/auth/callback` must go through middleware for state validation) |
 | Infinite redirect loop (cross-domain) | `accounts_session` cookie rejected cross-site | SSO login-initiated flow handles this automatically — ensure SSO server is updated |
 | `jsonwebtoken` crash in middleware | Next.js Edge Runtime doesn't support Node.js `crypto` | Use manual base64 JWT decode (see middleware example above). Do NOT use `jsonwebtoken` in middleware. |
