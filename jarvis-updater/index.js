@@ -20,7 +20,7 @@ const SLACK_BOT_TOKEN = env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL_ID = env.SLACK_CHANNEL_ID;
 const CLAUDE_API_KEY = env.CLAUDE_API_KEY;
 const WORKSPACE_PATH = env.WORKSPACE_PATH;
-const CRON_SCHEDULE = env.CRON_SCHEDULE || "*/30 * * * *";
+const CRON_SCHEDULE = env.CRON_SCHEDULE || "0 */3 * * *";
 const LOOKBACK_HOURS = parseInt(env.LOOKBACK_HOURS || "6", 10);
 
 const REPOS = [
@@ -87,12 +87,19 @@ function collectRawActivity(repoDir, subPath) {
   };
 }
 
+const IS_WINDOWS = process.platform === "win32";
+const VS_CODE_STORAGE = IS_WINDOWS
+  ? resolve(process.env.APPDATA, "Code/User/workspaceStorage")
+  : resolve(process.env.HOME, "Library/Application Support/Code/User/workspaceStorage");
+
 // Extract recent Copilot chat conversations from VS Code local storage
 function getCopilotChats() {
-  const sessionsDir = resolve(
-    process.env.HOME,
-    "Library/Application Support/Code/User/workspaceStorage/04ed59c7be11cb57c96bcebee1fa76cc/chatSessions"
-  );
+  const storageId = findWorkspaceStorageId();
+  if (!storageId) {
+    console.error("Could not find workspace storage ID, skipping chat sessions.");
+    return [];
+  }
+  const sessionsDir = join(VS_CODE_STORAGE, storageId, "chatSessions");
 
   try {
     const files = readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
@@ -142,29 +149,29 @@ function getCopilotChats() {
 
 // Find the workspace storage ID dynamically (in case it changes)
 function findWorkspaceStorageId() {
-  const storageRoot = resolve(process.env.HOME, "Library/Application Support/Code/User/workspaceStorage");
   try {
-    const dirs = readdirSync(storageRoot);
+    const dirs = readdirSync(VS_CODE_STORAGE);
     for (const dir of dirs) {
-      const chatDir = join(storageRoot, dir, "chatSessions");
+      const chatDir = join(VS_CODE_STORAGE, dir, "chatSessions");
       try {
         const stat = statSync(chatDir);
         if (stat.isDirectory()) {
           // Check if this workspace matches by looking for our workspace path in workspace.json
-          const wsFile = join(storageRoot, dir, "workspace.json");
+          const wsFile = join(VS_CODE_STORAGE, dir, "workspace.json");
           try {
             const ws = JSON.parse(readFileSync(wsFile, "utf-8"));
-            const folder = ws.folder || "";
-            if (folder.includes("360-SSO")) return dir;
+            const folder = (ws.folder || "").replace(/\\/g, "/");
+            const workspaceName = WORKSPACE_PATH.replace(/\\/g, "/").split("/").pop();
+            if (folder.includes(workspaceName)) return dir;
           } catch {}
         }
       } catch {}
     }
   } catch {}
-  return "04ed59c7be11cb57c96bcebee1fa76cc"; // fallback to known ID
+  return null;
 }
 
-const WORKSPACE_STORAGE_ID = findWorkspaceStorageId();
+
 
 async function askClaude(activities, chats) {
   // Build raw git data

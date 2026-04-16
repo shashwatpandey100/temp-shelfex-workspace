@@ -72,7 +72,7 @@ async function generateCodeChallenge(verifier: string): Promise<string> {
 }
 
 async function redirectToSSO(request: NextRequest) {
-  const ssoUrl = process.env.NEXT_PUBLIC_SSO_URL || 'http://localhost:8000/api/v1';
+  const ssoUrl = process.env.NEXT_PUBLIC_SSO_API_URL || 'http://localhost:8000/api/v1';
   const clientId = process.env.NEXT_PUBLIC_CLIENT_ID || 'shelf360';
   const callbackUrl = process.env.NEXT_PUBLIC_CALLBACK_URL || 'http://localhost:3001/auth/callback';
 
@@ -99,10 +99,13 @@ async function redirectToSSO(request: NextRequest) {
   const authorizeUrl = `${ssoUrl}/oauth/authorize?${params.toString()}`;
 
   const response = NextResponse.redirect(authorizeUrl);
+  // SameSite=None is required because the OAuth redirect chain goes cross-site
+  // (localhost → SSO → localhost), and browsers won't send SameSite=Lax cookies
+  // on the final redirect back. Secure=true works on localhost (secure context).
   const cookieOptions = {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax' as const,
+    secure: true,
+    sameSite: 'none' as const,
     maxAge: 60 * 10, // 10 minutes
     path: '/',
   };

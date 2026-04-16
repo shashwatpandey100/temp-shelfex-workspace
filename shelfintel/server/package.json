@@ -3,11 +3,9 @@
   "version": "1.0.0",
   "main": "src/server.ts",
   "scripts": {
-    "dev": "cross-env NODE_ENV=development NODE_OPTIONS=--max-old-space-size=512 ts-node-dev --respawn --transpile-only src/server.ts",
-    "build": "rimraf dist && tsc",
-    "start": "cross-env NODE_ENV=production node dist/server.js",
-    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
-    "format": "prettier --write \"src/**/*.ts\""
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
   },
   "keywords": [],
   "author": "",

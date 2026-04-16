@@ -19,7 +19,6 @@ const shutdown = (signal: string) => {
     process.exit(0);
   });
 
-  // Force exit if graceful shutdown takes too long
   setTimeout(() => {
     logger.error('Forced shutdown — connections did not close in time');
     process.exit(1);

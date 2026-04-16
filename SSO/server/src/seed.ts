@@ -85,6 +85,7 @@ async function seedClientApps() {
         allowedRedirectUris: [
           'http://localhost:3000/callback',
           'http://localhost:3000/auth/callback',
+          'http://localhost:3002/auth/callback',
         ],
       },
       {
